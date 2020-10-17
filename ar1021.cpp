@@ -1,266 +1,585 @@
-/*!
+
+
+/*
+ *  Copyright 2013 Embedded Artists AB
  *
- *  @file AR1021.cpp
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
  *
- *  @mainpage Adafruit STMPE610 Resistive Touch Screen Controller
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
- *  @section intro_sec Introduction
- *
- *  This is a library for the Adafruit STMPE610 Resistive
- *  touch screen controller breakout
- *  ----> http://www.adafruit.com/products/1571
- *
- *  Check out the links above for our tutorials and wiring diagrams
- *  These breakouts use SPI or I2C to communicate
- *
- *  Adafruit invests time and resources providing this open source code,
- *  please support Adafruit and open-source hardware by purchasing
- *  products from Adafruit!
- *
- *  @section author Author
- *
- *  Written by Limor Fried/Ladyada for Adafruit Industries.
- *
- *  @section license License
- *
- *  MIT license, all text above must be included in any redistribution
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
  */
 
-//#include "Arduino.h"
-
-//#include <SPI.h>
-//#include <Wire.h>
+/******************************************************************************
+ * Includes
+ *****************************************************************************/
 
 #include "ar1021.h"
 
-volatile bool AR1021::_haveData;
+/******************************************************************************
+ * Defines and typedefs
+ *****************************************************************************/
+
+#define AR1021_REG_TOUCH_THRESHOLD        (0x02)
+#define AR1021_REG_SENS_FILTER            (0x03)
+#define AR1021_REG_SAMPLING_FAST          (0x04)
+#define AR1021_REG_SAMPLING_SLOW          (0x05)
+#define AR1021_REG_ACC_FILTER_FAST        (0x06)
+#define AR1021_REG_ACC_FILTER_SLOW        (0x07)
+#define AR1021_REG_SPEED_THRESHOLD        (0x08)
+#define AR1021_REG_SLEEP_DELAY            (0x0A)
+#define AR1021_REG_PEN_UP_DELAY           (0x0B)
+#define AR1021_REG_TOUCH_MODE             (0x0C)
+#define AR1021_REG_TOUCH_OPTIONS          (0x0D)
+#define AR1021_REG_CALIB_INSETS           (0x0E)
+#define AR1021_REG_PEN_STATE_REPORT_DELAY (0x0F)
+#define AR1021_REG_TOUCH_REPORT_DELAY     (0x11)
 
 
-/*!
- *  @brief  Instantiates a new STMPE610 class using bitbang SPI
- *  @param  cspin
- *          CS pin
- *  @param  mosipin
- *          MOSI pin
- *  @param  misopin
- *          MISO pin
- *  @param  clkpin
- *          CLK pin
- *//*
-AR1021::AR1021(uint8_t cspin, uint8_t mosipin,
-                                     uint8_t misopin, uint8_t clkpin) {
-  _CS = cspin;
-  _MOSI = mosipin;
-  _MISO = misopin;
-  _CLK = clkpin;
-}*/
+#define AR1021_CMD_GET_VERSION                 (0x10)
+#define AR1021_CMD_ENABLE_TOUCH                (0x12)
+#define AR1021_CMD_DISABLE_TOUCH               (0x13)
+#define AR1021_CMD_CALIBRATE_MODE              (0x14)
+#define AR1021_CMD_REGISTER_READ               (0x20)
+#define AR1021_CMD_REGISTER_WRITE              (0x21)
+#define AR1021_CMD_REGISTER_START_ADDR_REQUEST (0x22)
+#define AR1021_CMD_REGISTER_WRITE_TO_EEPROM    (0x23)
+#define AR1021_CMD_EEPROM_READ                 (0x28)
+#define AR1021_CMD_EEPROM_WRITE                (0x29)
+#define AR1021_CMD_EEPROM_WRITE_TO_REGISTERS   (0x2B)
 
-/*!
- *  @brief  Instantiates a new AR1021 using provided SPI
- *  @param  cspin
- *          CS pin
- *  @param  *theSPI
- *          spi object
- */
-//AR1021::AR1021(uint8_t cspin, SPIClass *theSPI) {
-AR1021::AR1021(SPI_Master_t *spiAR1021)
+#define AR1021_RESP_STAT_OK           (0x00)
+#define AR1021_RESP_STAT_CMD_UNREC    (0x01)
+#define AR1021_RESP_STAT_HDR_UNREC    (0x03)
+#define AR1021_RESP_STAT_TIMEOUT      (0x04)
+#define AR1021_RESP_STAT_CANCEL_CALIB (0xFC)
+
+
+#define AR1021_ERR_NO_HDR      (-1000)
+#define AR1021_ERR_INV_LEN     (-1001)
+#define AR1021_ERR_INV_RESP    (-1002)
+#define AR1021_ERR_INV_RESPLEN (-1003)
+#define AR1021_ERR_TIMEOUT     (-1004)
+
+// bit 7 is always 1 and bit 0 defines pen up or down
+#define AR1021_PEN_MASK (0x81)
+
+#define AR1021_NUM_CALIB_POINTS (4)
+
+AR1021::AR1021(SPI_Master_t *spiAR1021,volatile TIMER *timeoutTimer)
 {
+  //_cs = 1; // active low
   _spiAR1021 = spiAR1021;
-//  _CS = cspin;
-//  _MOSI = _MISO = _CLK = -1;
- // _spi = theSPI;
-}
-
-/*!
- *  @brief  Instantiates a new AR1021 using provided Wire
- *  @param  *theWire
- *          wire object
- *//*
-AR1021::AR1021(TwoWire *theWire) {
-  _CS = _MISO = _MOSI = _CLK = -1;
-  _wire = theWire;
-}*/
-
-/*!
- *  @brief  Setups the HW
- *  @param  i2caddr
- *          I2C address (defaults to AR1021_ADDR)
- *  @return True if process is successful
- */
-bool AR1021::begin(uint8_t i2caddr) {
-
+  _timeoutTimer = timeoutTimer;
+  AR1021_INT_PORT.DIRCLR = AR1021_INT_PIN;
   AR1021_CS_PORT.DIRSET = AR1021_CS;
   AR1021_CS_PORT.OUTSET = AR1021_CS;
-/*
-  if (_CS != -1 && _CLK == -1) {
-    // hardware SPI
-    pinMode(_CS, OUTPUT);
-    digitalWrite(_CS, HIGH);
 
-    _spi->begin();
-    mySPISettings = SPISettings(1000000, MSBFIRST, SPI_MODE0);
-    m_spiMode = SPI_MODE0;
-  } else if (_CS != -1) {
-    // software SPI
-    pinMode(_CLK, OUTPUT);
-    pinMode(_CS, OUTPUT);
-    pinMode(_MOSI, OUTPUT);
-    pinMode(_MISO, INPUT);
-  } else {
-    _wire->begin();
-    _i2caddr = i2caddr;
+  //_spi.format(8, 1);
+  //_spi.frequency(500000);
+
+    // default calibration inset is 25 -> (25/2 = 12.5%)
+    _inset = 25;
+
+    // make sure _calibPoint has an invalid value to begin with
+    // correct value is set in calibrateStart()
+    _calibPoint = AR1021_NUM_CALIB_POINTS+1;
+
+    _x = 0;
+    _y = 0;
+    _pen = 0;
+
+    _initialized = false;
+}
+
+
+void AR1021::setDebug(Communication *debugCom)
+{
+  _debugCom = debugCom;
+}
+
+void AR1021::debug(const char *text)
+{
+  if(_debugCom!=NULL)
+    _debugCom->sendInfo(text,"BR");
+}
+
+void AR1021::debug(const char *text,int16_t zahl)
+{
+  if(_debugCom!=NULL)
+  {
+    char gesamtText[60];
+    sprintf(gesamtText,text,zahl);
+    _debugCom->sendInfo(gesamtText,"BR");
   }
-*/
-  // try mode0
-  /*
-  if (getVersion() != 0x811) {
-    if (_CS != -1 && _CLK == -1) {
-      // Serial.println("try MODE1");
-      mySPISettings = SPISettings(1000000, MSBFIRST, SPI_MODE1);
-      m_spiMode = SPI_MODE1;
+}
 
-      if (getVersion() != 0x811) {
-        return false;
-      }
-    } else {
-      return false;
+bool AR1021::read(touchCoordinate_t &coord) {
+
+    if (!_initialized) return false;
+
+    coord.x = _x * _width/4095;
+    coord.y = _y * _height/4095;
+    coord.z = _pen;
+
+    return true;
+}
+
+
+bool AR1021::init(uint16_t width, uint16_t height) {
+    int result = 0;
+    bool ok = false;
+    int attempts = 0;
+
+    _width = width;
+    _height = height;
+
+    while (1) {
+
+        do {
+            // disable touch
+            result = cmd(AR1021_CMD_DISABLE_TOUCH, NULL, 0, NULL, 0);
+            if (result == -AR1021_RESP_STAT_CANCEL_CALIB) {
+                debug("calibration was cancelled, short delay and try again");
+                _delay_us(50);
+                result = cmd(AR1021_CMD_DISABLE_TOUCH, NULL, 0, NULL, 0);
+            }
+            if (result != 0) {
+                debug("disable touch failed (%d)\n", result);
+                break;
+            }
+            _delay_us(50);
+
+            char regOffset = 0;
+            int regOffLen = 1;
+            result = cmd(AR1021_CMD_REGISTER_START_ADDR_REQUEST, NULL, 0,
+                    &regOffset, &regOffLen);
+            if (result != 0) {
+                debug("register offset request failed (%d)\n", result);
+                break;
+            }
+
+            // enable calibrated coordinates
+            //                  high, low address,                        len,  value
+            char toptions[4] = {0x00, AR1021_REG_TOUCH_OPTIONS+regOffset, 0x01, 0x01};
+            result = cmd(AR1021_CMD_REGISTER_WRITE, toptions, 4, NULL, 0);
+            if (result != 0) {
+                debug("register write request failed (%d)\n", result);
+                break;
+            }
+
+            // save registers to eeprom
+            result = cmd(AR1021_CMD_REGISTER_WRITE_TO_EEPROM, NULL, 0, NULL, 0);
+            if (result != 0) {
+                debug("register write to eeprom failed (%d)\n", result);
+                break;
+            }
+
+            // enable touch
+            result = cmd(AR1021_CMD_ENABLE_TOUCH, NULL, 0, NULL, 0);
+            if (result != 0) {
+                debug("enable touch failed (%d)\n", result);
+                break;
+            }
+
+            //_siqIrq.rise(this, &AR1021::readTouchIrq);
+
+            _initialized = true;
+            ok = true;
+
+        } while(0);
+
+        if (ok) break;
+
+        // try to run the initialize sequence at most 2 times
+        if(++attempts >= 2) break;
     }
-  }*/
-  writeRegister8(AR1021_SYS_CTRL1, AR1021_SYS_CTRL1_RESET);
-  _delay_ms(10);
 
-  for (uint8_t i = 0; i < 65; i++) {
-    readRegister8(i);
-  }
 
-  writeRegister8(AR1021_SYS_CTRL2, 0x0); // turn on clocks!
-  writeRegister8(AR1021_TSC_CTRL,
-                 AR1021_TSC_CTRL_XYZ | AR1021_TSC_CTRL_EN); // XYZ and enable!
-  // Serial.println(readRegister8(AR1021_TSC_CTRL), HEX);
-  writeRegister8(AR1021_INT_EN, AR1021_INT_EN_TOUCHDET);
-  writeRegister8(AR1021_ADC_CTRL1, AR1021_ADC_CTRL1_10BIT |
-                                      (0x6 << 4)); // 96 clocks per conversion
-  writeRegister8(AR1021_ADC_CTRL2, AR1021_ADC_CTRL2_6_5MHZ);
-  writeRegister8(AR1021_TSC_CFG, AR1021_TSC_CFG_4SAMPLE |
-                                    AR1021_TSC_CFG_DELAY_1MS |
-                                    AR1021_TSC_CFG_SETTLE_5MS);
-  writeRegister8(AR1021_TSC_FRACTION_Z, 0x6);
-  writeRegister8(AR1021_FIFO_TH, 1);
-  writeRegister8(AR1021_FIFO_STA, AR1021_FIFO_STA_RESET);
-  writeRegister8(AR1021_FIFO_STA, 0); // unreset
-  writeRegister8(AR1021_TSC_I_DRIVE, AR1021_TSC_I_DRIVE_50MA);
-  writeRegister8(AR1021_INT_STA, 0xFF); // reset all ints
-  writeRegister8(AR1021_INT_CTRL,
-                 AR1021_INT_CTRL_POL_HIGH | AR1021_INT_CTRL_ENABLE);
-
-  return true;
+    return ok;
 }
 
-/*!
- *  @brief  Returns true if touched, false otherwise
- *  @return True if if touched, false otherwise
- */
-bool AR1021::touched() {
-  return (readRegister8(AR1021_TSC_CTRL) & 0x80);
+bool AR1021::calibrateStart() {
+    bool ok = false;
+    int result = 0;
+    int attempts = 0;
+
+    if (!_initialized) return false;
+
+    //_siqIrq.rise(NULL);
+
+    while(1) {
+
+        do {
+            // disable touch
+            result = cmd(AR1021_CMD_DISABLE_TOUCH, NULL, 0, NULL, 0);
+            if (result != 0) {
+                debug("disable touch failed (%d)\n", result);
+                break;
+            }
+
+            char regOffset = 0;
+            int regOffLen = 1;
+            result = cmd(AR1021_CMD_REGISTER_START_ADDR_REQUEST, NULL, 0,
+                    &regOffset, &regOffLen);
+            if (result != 0) {
+                debug("register offset request failed (%d)\n", result);
+                break;
+            }
+
+            // set insets
+            // enable calibrated coordinates
+            //                high, low address,                       len,  value
+            char insets[4] = {0x00, AR1021_REG_CALIB_INSETS+regOffset, 0x01, _inset};
+            result = cmd(AR1021_CMD_REGISTER_WRITE, insets, 4, NULL, 0);
+            if (result != 0) {
+                debug("register write request failed (%d)\n", result);
+                break;
+            }
+
+            // calibration mode
+            char calibType = 4;
+            result = cmd(AR1021_CMD_CALIBRATE_MODE, &calibType, 1, NULL, 0, false);
+            if (result != 0) {
+                debug("calibration mode failed (%d)\n", result);
+                break;
+            }
+
+            _calibPoint = 0;
+            ok = true;
+
+        } while(0);
+
+        if (ok) break;
+
+        // try to run the calibrate mode sequence at most 2 times
+        if (++attempts >= 2) break;
+    }
+
+    return ok;
 }
 
-/*!
- *  @brief  Checks if buffer is empty
- *  @return True if empty, false otherwise
- */
-bool AR1021::bufferEmpty() {
-  return (readRegister8(AR1021_FIFO_STA) & AR1021_FIFO_STA_EMPTY);
+bool AR1021::getNextCalibratePoint(uint16_t* x, uint16_t* y) {
+
+    if (!_initialized) return false;
+    if (x == NULL || y == NULL) return false;
+
+    int xInset = (_width * _inset / 100) / 2;
+    int yInset = (_height * _inset / 100) / 2;
+
+    switch(_calibPoint) {
+    case 0:
+        *x = xInset;
+        *y = yInset;
+        break;
+    case 1:
+        *x = _width - xInset;
+        *y = yInset;
+        break;
+    case 2:
+        *x = _width - xInset;
+        *y = _height - yInset;
+        break;
+    case 3:
+        *x = xInset;
+        *y = _height - yInset;
+        break;
+    default:
+        return false;
+    }
+
+    return true;
 }
 
-/*!
- *  @brief  Returns the FIFO buffer size
- *  @return The FIFO buffer size
- */
-uint8_t AR1021::bufferSize() {
-  return readRegister8(AR1021_FIFO_SIZE);
+bool AR1021::waitForCalibratePoint(bool* morePoints, uint32_t timeout) {
+    int result = 0;
+    bool ret = false;
+
+    if (!_initialized) return false;
+
+    do {
+        if (morePoints == NULL || _calibPoint >= AR1021_NUM_CALIB_POINTS) {
+            break;
+        }
+
+        // wait for response
+        result = waitForCalibResponse(timeout);
+        if (result != 0) {
+            debug("wait for calibration response failed (%d)\n", result);
+            break;
+        }
+
+        _calibPoint++;
+        *morePoints = (_calibPoint < AR1021_NUM_CALIB_POINTS);
+
+
+        // no more points -> enable touch
+        if (!(*morePoints)) {
+
+            // wait for calibration data to be written to eeprom
+            // before enabling touch
+            result = waitForCalibResponse(timeout);
+            if (result != 0) {
+                debug("wait for calibration response failed (%d)\n", result);
+                break;
+            }
+
+
+            // clear chip-select since calibration is done;
+            unselect(); //_cs = 1;
+
+            result = cmd(AR1021_CMD_ENABLE_TOUCH, NULL, 0, NULL, 0);
+            if (result != 0) {
+                debug("enable touch failed (%d)\n", result);
+                break;
+            }
+
+            //_siqIrq.rise(this, &AR1021::readTouchIrq);
+        }
+
+        ret = true;
+
+    } while (0);
+
+
+
+    if (!ret) {
+        // make sure to set chip-select off in case of an error
+        unselect(); // _cs = 1;
+        // calibration must restart if an error occurred
+        _calibPoint = AR1021_NUM_CALIB_POINTS+1;
+    }
+
+
+
+    return ret;
 }
 
-/*!
- *  @brief  Returns the AR1021 version number
- *  @return The AR1021 version number
- */
-uint16_t AR1021::getVersion() {
-  uint16_t v;
-  // Serial.print("get version");
-  v = readRegister8(0);
-  v <<= 8;
-  v |= readRegister8(1);
-  // Serial.print("Version: 0x"); Serial.println(v, HEX);
-  return v;
+int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,
+        bool setCsOff) {
+
+    int ret = 0;
+
+    // command request
+    // ---------------
+    // 0x55 len cmd data
+    // 0x55 = header
+    // len = data length + cmd (1)
+    // data = data to send
+
+    select(); //_cs = 0;
+
+    SPI_MasterTransceiveByte(_spiAR1021,0x55); // _spi.write(0x55);
+    _delay_us(50); // according to data sheet there must be an inter-byte delay of ~50us
+    SPI_MasterTransceiveByte(_spiAR1021,len+1); // _spi.write(len+1);
+    _delay_us(50);
+    SPI_MasterTransceiveByte(_spiAR1021,cmd); // _spi.write(cmd);
+    _delay_us(50);
+
+    for(int i = 0; i < len; i++) {
+        SPI_MasterTransceiveByte(_spiAR1021,data[i]); // __spi.write(data[i]);
+        _delay_us(50);
+    }
+
+
+    // wait for response (siq goes high when response is available)
+    // Timer t;
+    // t.start();
+    _timeoutTimer->value= 101;
+    _timeoutTimer->state=TM_START;
+
+    //while(_siq.read() != 1 && t.read_ms() < 1000);
+    while( ((AR1021_INT_PORT.IN & AR1021_INT_PIN)==0) && _timeoutTimer->state != TM_STOP);
+
+
+    // command response
+    // ---------------
+    // 0x55 len status cmd data
+    // 0x55 = header
+    // len = number of bytes following the len byte
+    // status = status
+    // cmd = command ID
+    // data = data to receive
+
+
+    do {
+
+        //if (t.read_ms() >= 1000) {
+        if (_timeoutTimer->state == TM_STOP)
+        {
+            ret = AR1021_ERR_TIMEOUT;
+            break;
+        }
+
+        int head = SPI_MasterTransceiveByte(_spiAR1021,0); // __spi.write(0);
+        if (head != 0x55) {
+            ret = AR1021_ERR_NO_HDR;
+            break;
+        }
+
+        _delay_us(50);
+        int len = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        if (len < 2) {
+            ret = AR1021_ERR_INV_LEN;
+            break;
+        }
+
+        _delay_us(50);
+        int status = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        if (status != AR1021_RESP_STAT_OK) {
+            ret = -status;
+            break;
+        }
+
+        _delay_us(50);
+        int cmdId = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        if (cmdId != cmd) {
+            ret = AR1021_ERR_INV_RESP;
+            break;
+        }
+
+        if ( ((len-2) > 0 && respLen  == NULL)
+                || ((len-2) > 0 && respLen != NULL && *respLen < (len-2))) {
+            ret = AR1021_ERR_INV_RESPLEN;
+            break;
+        }
+
+        for (int i = 0; i < len-2;i++) {
+            _delay_us(50);
+            respBuf[i] = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        }
+        if (respLen != NULL) {
+            *respLen = len-2;
+        }
+
+        // make sure we wait 50us before issuing a new cmd
+        _delay_us(50);
+
+    } while (0);
+
+
+
+    // disable chip-select if setCsOff is true or if an error occurred
+    if (setCsOff || ret != 0) {
+        unselect(); // _cs = 1;
+    }
+
+
+
+    return ret;
 }
 
-/*!
- *  @brief  Reads touchscreen data
- *  @param  *x
- *	    The x coordinate
- *  @param  *y
- *	    The y coordinate
- *  @param  *z
- *	    The z coordinate
- */
-void AR1021::readData(uint16_t *x, uint16_t *y, uint8_t *z) {
-  uint8_t data[4];
+int AR1021::waitForCalibResponse(uint32_t timeout) {
+    //Timer t;
+    int ret = 0;
 
-  for (uint8_t i = 0; i < 4; i++) {
-    data[i] = readRegister8(0xD7); // _spi->transfer(0x00);
-    // Serial.print("0x"); Serial.print(data[i], HEX); Serial.print(" / ");
-  }
-  *x = data[0];
-  *x <<= 4;
-  *x |= (data[1] >> 4);
-  *y = data[1] & 0x0F;
-  *y <<= 8;
-  *y |= data[2];
-  *z = data[3];
+    _timeoutTimer->value = timeout;
+    _timeoutTimer->state = TM_START; // t.start();
+
+    // wait for siq
+    // while (_siq.read() != 1 && (timeout == 0 || (uint32_t)t.read_ms() < (int)timeout));
+    while ( ((AR1021_INT_PORT.IN & AR1021_INT_PIN)==0) && (timeout == 0 || _timeoutTimer->state != TM_STOP ) );
+
+
+    do {
+
+        // if (timeout >  0 && (uint32_t)t.read_ms() >= timeout)
+        if (timeout >  0 && _timeoutTimer->state == TM_STOP )
+        {
+            ret = AR1021_ERR_TIMEOUT;
+            break;
+        }
+
+        int head = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        if (head != 0x55) {
+            ret = AR1021_ERR_NO_HDR;
+            break;
+        }
+
+        _delay_us(50);
+        int len = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        if (len != 2) {
+            ret = AR1021_ERR_INV_LEN;
+            break;
+        }
+
+        _delay_us(50);
+        int status = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        if (status != AR1021_RESP_STAT_OK) {
+            ret = -status;
+            break;
+        }
+
+        _delay_us(50);
+        int cmdId = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        if (cmdId != 0x14) {
+            ret = AR1021_ERR_INV_RESP;
+            break;
+        }
+
+
+        // make sure we wait 50us before issuing a new cmd
+        _delay_us(50);
+
+    } while (0);
+
+
+    return ret;
 }
 
-/*!
- *  @brief  Returns point for touchscreen data
- *  @return The touch point using TS_Point
- */
-TS_Point AR1021::getPoint() {
-  uint16_t x, y;
-  uint8_t z;
 
-  /* Making sure that we are reading all data before leaving */
-  while (!bufferEmpty()) {
-    readData(&x, &y, &z);
-  }
+void AR1021::readTouchIrq()
+{
+    //while(_siq.read() == 1)
+    while(AR1021_INT_PORT.IN && AR1021_INT_PIN)
+    {
 
-  if (bufferEmpty())
-    writeRegister8(AR1021_INT_STA, 0xFF); // reset all ints
+        select(); // _cs = 0;
 
-  return TS_Point(x, y, z);
+        // touch coordinates are sent in a 5-byte data packet
+
+        int pen = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        _delay_us(50);
+
+        int xlo = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        _delay_us(50);
+
+        int xhi = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        _delay_us(50);
+
+        int ylo = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        _delay_us(50);
+
+        int yhi = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        _delay_us(50);
+
+        unselect(); //_cs = 1;
+
+
+        // pen down
+        if ((pen&AR1021_PEN_MASK) == (1<<7|1<<0)) {
+            _pen = 1;
+        }
+        // pen up
+        else if ((pen&AR1021_PEN_MASK) == (1<<7)){
+            _pen = 0;
+        }
+        // invalid value
+        else {
+            continue;
+        }
+
+        _x = ((xhi<<7)|xlo);
+        _y = ((yhi<<7)|ylo);
+
+    }
 }
-
-/*!
- *  @brief  Reads SPI data
- */
-/*uint8_t AR1021::spiIn() {
-  if (_CLK == -1) {
-    uint8_t d = _spi->transfer(0);
-    return d;
-  } else
-    return shiftIn(_MISO, _CLK, MSBFIRST);
-}*/
-
-/*!
- *  @brief  Sends data through SPI
- *  @param  x
- *          Data to send (one byte)
- */
-/*void AR1021::spiOut(uint8_t x) {
-  if (_CLK == -1) {
-    _spi->transfer(x);
-  } else
-    shiftOut(_MOSI, _CLK, MSBFIRST, x);
-}*/
-
 
 void AR1021::select() {
   AR1021_CS_PORT.OUTCLR = AR1021_CS;
@@ -270,157 +589,11 @@ void AR1021::unselect() {
   AR1021_CS_PORT.OUTSET = AR1021_CS;
 }
 
-
-/*!
- *  @brief  Reads 8bit of data from specified register
- *  @param  reg
- *          The register
- *  @return Data in the register
- */
-uint8_t AR1021::readRegister8(uint8_t reg) {
-/*  uint8_t x;
-  if (_CS == -1) {
-    // use i2c
-    _wire->beginTransmission(_i2caddr);
-    _wire->write((byte)reg);
-    _wire->endTransmission();
-    _wire->requestFrom(_i2caddr, (byte)1);
-    x = _wire->read();
-
-    // Serial.print("$"); Serial.print(reg, HEX);
-    // Serial.print(": 0x"); Serial.println(x, HEX);
-  } else {
-    if (_CLK == -1)
-      _spi->beginTransaction(mySPISettings);
-
-    digitalWrite(_CS, LOW);
-    spiOut(0x80 | reg);
-    spiOut(0x00);
-    x = spiIn();
-    digitalWrite(_CS, HIGH);
-
-    if (_CLK == -1)
-      SPI.endTransaction();
-  }
-
-  return x;*/
-
-  select();
-  SPI_MasterTransceiveByte(_spiAR1021,reg | 0x80);
-  uint8_t regval = SPI_MasterTransceiveByte(_spiAR1021,0);
-  unselect();
-  return regval;
-
-
-}
-
-/*!
- *  @brief  Reads 16 bits of data from specified register
- *  @param  reg
- *          The register
- *  @return Data in the register
- */
-/*uint16_t AR1021::readRegister16(uint8_t reg) {
-  uint16_t x = 0;
-  if (_CS == -1) {
-    // use i2c
-    _wire->beginTransmission(_i2caddr);
-    _wire->write((byte)reg);
-    _wire->endTransmission();
-    _wire->requestFrom(_i2caddr, (byte)2);
-    x = _wire->read();
-    x <<= 8;
-    x |= _wire->read();
-  }
-  if (_CLK == -1) {
-    // hardware SPI
-    if (_CLK == -1)
-      _spi->beginTransaction(mySPISettings);
-    digitalWrite(_CS, LOW);
-    spiOut(0x80 | reg);
-    spiOut(0x00);
-    x = spiIn();
-    x <<= 8;
-    x |= spiIn();
-    digitalWrite(_CS, HIGH);
-    if (_CLK == -1)
-      _spi->endTransaction();
-  }
-
-  // Serial.print("$"); Serial.print(reg, HEX);
-  // Serial.print(": 0x"); Serial.println(x, HEX);
-  return x;
-}
-*/
-/*!
- *  @brief  Writes 8 bit of data to specified register
- *  @param  reg
- *	    The register
- *  @param  val
- *          Value to write
- */
-void AR1021::writeRegister8(uint8_t reg, uint8_t val) {
-/*  if (_CS == -1) {
-    // use i2c
-    _wire->beginTransmission(_i2caddr);
-    _wire->write((byte)reg);
-    _wire->write(val);
-    _wire->endTransmission();
-  } else {
-    if (_CLK == -1)
-      _spi->beginTransaction(mySPISettings);
-    digitalWrite(_CS, LOW);
-    spiOut(reg);
-    spiOut(val);
-    digitalWrite(_CS, HIGH);
-    if (_CLK == -1)
-      _spi->endTransaction();
-  }*/
-  select();
-  SPI_MasterTransceiveByte(_spiAR1021,reg);
-  SPI_MasterTransceiveByte(_spiAR1021,val);
-  unselect();
-
-}
-
-/*!
- *  @brief  TS_Point constructor
- */
-TS_Point::TS_Point() { x = y = 0; }
-
-/*!
- *  @brief  TS_Point constructor
- *  @param  x0
- *          Initial x
- *  @param  y0
- *          Initial y
- *  @param  z0
- *          Initial z
- */
-TS_Point::TS_Point(int16_t x0, int16_t y0, int16_t z0) {
-  x = x0;
-  y = y0;
-  z = z0;
-}
-
-/*!
- *  @brief  Equality operator for TS_Point
- *  @return True if points are equal
- */
-bool TS_Point::operator==(TS_Point p1) {
-  return ((p1.x == x) && (p1.y == y) && (p1.z == z));
-}
-
-/*!
- *  @brief  Non-equality operator for TS_Point
- *  @return True if points are not equal
- */
-bool TS_Point::operator!=(TS_Point p1) {
-  return ((p1.x != x) || (p1.y != y) || (p1.z != z));
-}
-
-
-ISR( AR1021_INTVEC )
+uint8_t AR1021::readRegister8(uint8_t reg)
 {
-	AR1021::_haveData = true;
+uint8_t ret;
+  select();
+  ret = SPI_MasterTransceiveByte(_spiAR1021,reg);
+  unselect();
+  return(ret);
 }
