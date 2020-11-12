@@ -22,57 +22,9 @@
 
 #include "ar1021.h"
 
-/******************************************************************************
- * Defines and typedefs
- *****************************************************************************/
 
-#define AR1021_REG_TOUCH_THRESHOLD        (0x02)
-#define AR1021_REG_SENS_FILTER            (0x03)
-#define AR1021_REG_SAMPLING_FAST          (0x04)
-#define AR1021_REG_SAMPLING_SLOW          (0x05)
-#define AR1021_REG_ACC_FILTER_FAST        (0x06)
-#define AR1021_REG_ACC_FILTER_SLOW        (0x07)
-#define AR1021_REG_SPEED_THRESHOLD        (0x08)
-#define AR1021_REG_SLEEP_DELAY            (0x0A)
-#define AR1021_REG_PEN_UP_DELAY           (0x0B)
-#define AR1021_REG_TOUCH_MODE             (0x0C)
-#define AR1021_REG_TOUCH_OPTIONS          (0x0D)
-#define AR1021_REG_CALIB_INSETS           (0x0E)
-#define AR1021_REG_PEN_STATE_REPORT_DELAY (0x0F)
-#define AR1021_REG_TOUCH_REPORT_DELAY     (0x11)
-
-
-#define AR1021_CMD_GET_VERSION                 (0x10)
-#define AR1021_CMD_ENABLE_TOUCH                (0x12)
-#define AR1021_CMD_DISABLE_TOUCH               (0x13)
-#define AR1021_CMD_CALIBRATE_MODE              (0x14)
-#define AR1021_CMD_REGISTER_READ               (0x20)
-#define AR1021_CMD_REGISTER_WRITE              (0x21)
-#define AR1021_CMD_REGISTER_START_ADDR_REQUEST (0x22)
-#define AR1021_CMD_REGISTER_WRITE_TO_EEPROM    (0x23)
-#define AR1021_CMD_EEPROM_READ                 (0x28)
-#define AR1021_CMD_EEPROM_WRITE                (0x29)
-#define AR1021_CMD_EEPROM_WRITE_TO_REGISTERS   (0x2B)
-
-#define AR1021_RESP_STAT_OK           (0x00)
-#define AR1021_RESP_STAT_CMD_UNREC    (0x01)
-#define AR1021_RESP_STAT_HDR_UNREC    (0x03)
-#define AR1021_RESP_STAT_TIMEOUT      (0x04)
-#define AR1021_RESP_STAT_CANCEL_CALIB (0xFC)
-
-
-#define AR1021_ERR_NO_HDR      (-1000)
-#define AR1021_ERR_INV_LEN     (-1001)
-#define AR1021_ERR_INV_RESP    (-1002)
-#define AR1021_ERR_INV_RESPLEN (-1003)
-#define AR1021_ERR_TIMEOUT     (-1004)
-
-// bit 7 is always 1 and bit 0 defines pen up or down
-#define AR1021_PEN_MASK (0x81)
-
-#define AR1021_NUM_CALIB_POINTS (4)
-
-AR1021::AR1021(SPI_Master_t *spiAR1021,volatile TIMER *timeoutTimer)
+/*
+AR1021::AR1021(volatile TIMER *timeoutTimer,)
 {
   //_cs = 1; // active low
   _spiAR1021 = spiAR1021;
@@ -97,7 +49,7 @@ AR1021::AR1021(SPI_Master_t *spiAR1021,volatile TIMER *timeoutTimer)
 
     _initialized = false;
 }
-
+*/
 
 void AR1021::setDebug(Communication *debugCom)
 {
@@ -120,26 +72,37 @@ void AR1021::debug(const char *text,int16_t zahl)
   }
 }
 
-bool AR1021::read(touchCoordinate_t &coord) {
+bool AR1021::read(touchCoordinate_t &coord)
+{
 
-    if (!_initialized) return false;
+  if (!_initialized) return false;
 
-    coord.x = _x * _width/4095;
-    coord.y = _y * _height/4095;
-    coord.z = _pen;
-
+  //coord.x = (actual.x * _width)/4095;
+  //coord.y = (actual.y * _height)/4095;
+  coord.x = actual.x;
+  coord.y = actual.y;
+  coord.touched = actual.touched;
+  if( compareCoord(actual,lastActual) )
+    return false;
+  else
+  {
+    lastActual.x = actual.x;
+    lastActual.y = actual.y;
+    lastActual.touched = actual.touched;
     return true;
+  }
 }
 
 
-bool AR1021::init(uint16_t width, uint16_t height) {
+bool AR1021::init(uint16_t width, uint16_t height, bool rotated = false)
+{
     int result = 0;
     bool ok = false;
     int attempts = 0;
 
     _width = width;
     _height = height;
-
+    _rotated = rotated;
     while (1) {
 
         do {
@@ -151,7 +114,7 @@ bool AR1021::init(uint16_t width, uint16_t height) {
                 result = cmd(AR1021_CMD_DISABLE_TOUCH, NULL, 0, NULL, 0);
             }
             if (result != 0) {
-                debug("disable touch failed (%d)\n", result);
+                debug("disable touch failed (%d)", result);
                 break;
             }
             _delay_us(50);
@@ -161,30 +124,27 @@ bool AR1021::init(uint16_t width, uint16_t height) {
             result = cmd(AR1021_CMD_REGISTER_START_ADDR_REQUEST, NULL, 0,
                     &regOffset, &regOffLen);
             if (result != 0) {
-                debug("register offset request failed (%d)\n", result);
+                debug("register offset request failed (%d)", result);
                 break;
             }
-
             // enable calibrated coordinates
             //                  high, low address,                        len,  value
-            char toptions[4] = {0x00, AR1021_REG_TOUCH_OPTIONS+regOffset, 0x01, 0x01};
-            result = cmd(AR1021_CMD_REGISTER_WRITE, toptions, 4, NULL, 0);
-            if (result != 0) {
-                debug("register write request failed (%d)\n", result);
-                break;
-            }
+            // char toptions[4] = {0x00, AR1021_REG_TOUCH_OPTIONS+regOffset, 0x01, 0x01};
+            setRegister(AR1021_REG_TOUCH_OPTIONS,0,regOffset);
+            setRegister(AR1021_REG_SENS_FILTER,0x04,regOffset);
+            setRegister(AR1021_REG_TOUCH_THRESHOLD,0xc5,regOffset);
 
             // save registers to eeprom
             result = cmd(AR1021_CMD_REGISTER_WRITE_TO_EEPROM, NULL, 0, NULL, 0);
             if (result != 0) {
-                debug("register write to eeprom failed (%d)\n", result);
+                debug("register write to eeprom failed (%d)", result);
                 break;
             }
 
             // enable touch
             result = cmd(AR1021_CMD_ENABLE_TOUCH, NULL, 0, NULL, 0);
             if (result != 0) {
-                debug("enable touch failed (%d)\n", result);
+                debug("enable touch failed (%d)", result);
                 break;
             }
 
@@ -205,6 +165,46 @@ bool AR1021::init(uint16_t width, uint16_t height) {
     return ok;
 }
 
+void  AR1021::setRegister(uint8_t reg,uint8_t val,uint8_t offset)
+{
+char toptions[4] = {0x00, reg+offset, 0x01, val};
+  int result = cmd(AR1021_CMD_REGISTER_WRITE, toptions, 4, NULL, 0);
+  if (result != 0)
+      debug("register write request failed (%d)", result);
+}
+
+void  AR1021::registerDump()
+{
+int result = 0;
+char myResp[4];
+int myNum;
+char regOffset = 0;
+int regOffLen = 1;
+
+  result = cmd(AR1021_CMD_REGISTER_START_ADDR_REQUEST, NULL, 0,&regOffset, &regOffLen);
+  if (result != 0)
+    debug("register offset request failed (%d)", result);
+  debug("offset: %x",regOffset);
+
+  myNum = 3;
+  result = cmd(AR1021_CMD_GET_VERSION,NULL,0,myResp,&myNum);
+  if (result != 0)
+    debug("version request failed (%d)", result);
+  debug("version: %x", myResp[0]);
+  debug("version: %x", myResp[1]);
+  debug("version: %x", myResp[2]);
+
+
+  for(uint8_t i=0;i<0x12;i++)
+  {
+    myNum = 1;
+    char myOptions[3] = {0x00, regOffset+i, 1};
+    result = cmd(AR1021_CMD_REGISTER_READ,myOptions,3,myResp,&myNum);
+      debug("reg: %x",myResp[0]);
+  }
+
+}
+
 bool AR1021::calibrateStart() {
     bool ok = false;
     int result = 0;
@@ -220,7 +220,7 @@ bool AR1021::calibrateStart() {
             // disable touch
             result = cmd(AR1021_CMD_DISABLE_TOUCH, NULL, 0, NULL, 0);
             if (result != 0) {
-                debug("disable touch failed (%d)\n", result);
+                debug("disable touch failed (%d)", result);
                 break;
             }
 
@@ -229,7 +229,7 @@ bool AR1021::calibrateStart() {
             result = cmd(AR1021_CMD_REGISTER_START_ADDR_REQUEST, NULL, 0,
                     &regOffset, &regOffLen);
             if (result != 0) {
-                debug("register offset request failed (%d)\n", result);
+                debug("register offset request failed (%d)", result);
                 break;
             }
 
@@ -239,7 +239,7 @@ bool AR1021::calibrateStart() {
             char insets[4] = {0x00, AR1021_REG_CALIB_INSETS+regOffset, 0x01, _inset};
             result = cmd(AR1021_CMD_REGISTER_WRITE, insets, 4, NULL, 0);
             if (result != 0) {
-                debug("register write request failed (%d)\n", result);
+                debug("register write request failed (%d)", result);
                 break;
             }
 
@@ -247,7 +247,7 @@ bool AR1021::calibrateStart() {
             char calibType = 4;
             result = cmd(AR1021_CMD_CALIBRATE_MODE, &calibType, 1, NULL, 0, false);
             if (result != 0) {
-                debug("calibration mode failed (%d)\n", result);
+                debug("calibration mode failed (%d)", result);
                 break;
             }
 
@@ -326,17 +326,17 @@ bool AR1021::waitForCalibratePoint(bool* morePoints, uint32_t timeout) {
             // before enabling touch
             result = waitForCalibResponse(timeout);
             if (result != 0) {
-                debug("wait for calibration response failed (%d)\n", result);
+                debug("wait for calibration response failed (%d)", result);
                 break;
             }
 
 
             // clear chip-select since calibration is done;
-            unselect(); //_cs = 1;
+            spiDevice::unselect(); //_cs = 1;
 
             result = cmd(AR1021_CMD_ENABLE_TOUCH, NULL, 0, NULL, 0);
             if (result != 0) {
-                debug("enable touch failed (%d)\n", result);
+                debug("enable touch failed (%d)", result);
                 break;
             }
 
@@ -351,7 +351,7 @@ bool AR1021::waitForCalibratePoint(bool* morePoints, uint32_t timeout) {
 
     if (!ret) {
         // make sure to set chip-select off in case of an error
-        unselect(); // _cs = 1;
+        spiDevice::unselect(); // _cs = 1;
         // calibration must restart if an error occurred
         _calibPoint = AR1021_NUM_CALIB_POINTS+1;
     }
@@ -361,8 +361,8 @@ bool AR1021::waitForCalibratePoint(bool* morePoints, uint32_t timeout) {
     return ret;
 }
 
-int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,
-        bool setCsOff) {
+int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,bool setCsOff)
+{
 
     int ret = 0;
 
@@ -373,17 +373,17 @@ int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,
     // len = data length + cmd (1)
     // data = data to send
 
-    select(); //_cs = 0;
+    spiDevice::select(); //_cs = 0;
 
-    SPI_MasterTransceiveByte(_spiAR1021,0x55); // _spi.write(0x55);
+    transceiveByte(0x55); // _spi.write(0x55);
     _delay_us(50); // according to data sheet there must be an inter-byte delay of ~50us
-    SPI_MasterTransceiveByte(_spiAR1021,len+1); // _spi.write(len+1);
+    transceiveByte(len+1); // _spi.write(len+1);
     _delay_us(50);
-    SPI_MasterTransceiveByte(_spiAR1021,cmd); // _spi.write(cmd);
+    transceiveByte(cmd); // _spi.write(cmd);
     _delay_us(50);
 
     for(int i = 0; i < len; i++) {
-        SPI_MasterTransceiveByte(_spiAR1021,data[i]); // __spi.write(data[i]);
+        transceiveByte(data[i]); // __spi.write(data[i]);
         _delay_us(50);
     }
 
@@ -393,9 +393,8 @@ int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,
     // t.start();
     _timeoutTimer->value= 101;
     _timeoutTimer->state=TM_START;
-
     //while(_siq.read() != 1 && t.read_ms() < 1000);
-    while( ((AR1021_INT_PORT.IN & AR1021_INT_PIN)==0) && _timeoutTimer->state != TM_STOP);
+    while( ((AR1021_INT_PORT.IN & AR1021_INT_PIN)==0) && (_timeoutTimer->state != TM_STOP));
 
 
     // command response
@@ -417,28 +416,29 @@ int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,
             break;
         }
 
-        int head = SPI_MasterTransceiveByte(_spiAR1021,0); // __spi.write(0);
+        int head = transceiveByte(0); // __spi.write(0);
         if (head != 0x55) {
             ret = AR1021_ERR_NO_HDR;
+            debug("wrong head: %d",head);
             break;
         }
 
         _delay_us(50);
-        int len = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int len = transceiveByte(0); // _spi.write(0);
         if (len < 2) {
             ret = AR1021_ERR_INV_LEN;
             break;
         }
 
         _delay_us(50);
-        int status = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int status = transceiveByte(0); // _spi.write(0);
         if (status != AR1021_RESP_STAT_OK) {
             ret = -status;
             break;
         }
 
         _delay_us(50);
-        int cmdId = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int cmdId = transceiveByte(0); // _spi.write(0);
         if (cmdId != cmd) {
             ret = AR1021_ERR_INV_RESP;
             break;
@@ -452,7 +452,7 @@ int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,
 
         for (int i = 0; i < len-2;i++) {
             _delay_us(50);
-            respBuf[i] = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+            respBuf[i] = transceiveByte(0); // _spi.write(0);
         }
         if (respLen != NULL) {
             *respLen = len-2;
@@ -467,7 +467,7 @@ int AR1021::cmd(char cmd, char* data, int len, char* respBuf, int* respLen,
 
     // disable chip-select if setCsOff is true or if an error occurred
     if (setCsOff || ret != 0) {
-        unselect(); // _cs = 1;
+        spiDevice::unselect(); // _cs = 1;
     }
 
 
@@ -496,28 +496,28 @@ int AR1021::waitForCalibResponse(uint32_t timeout) {
             break;
         }
 
-        int head = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int head = transceiveByte(0); // _spi.write(0);
         if (head != 0x55) {
             ret = AR1021_ERR_NO_HDR;
             break;
         }
 
         _delay_us(50);
-        int len = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int len = transceiveByte(0); // _spi.write(0);
         if (len != 2) {
             ret = AR1021_ERR_INV_LEN;
             break;
         }
 
         _delay_us(50);
-        int status = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int status = transceiveByte(0); // _spi.write(0);
         if (status != AR1021_RESP_STAT_OK) {
             ret = -status;
             break;
         }
 
         _delay_us(50);
-        int cmdId = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int cmdId = transceiveByte(0); // _spi.write(0);
         if (cmdId != 0x14) {
             ret = AR1021_ERR_INV_RESP;
             break;
@@ -537,63 +537,61 @@ int AR1021::waitForCalibResponse(uint32_t timeout) {
 void AR1021::readTouchIrq()
 {
     //while(_siq.read() == 1)
-    while(AR1021_INT_PORT.IN && AR1021_INT_PIN)
+    while(AR1021_INT_PORT.IN & AR1021_INT_PIN)
     {
 
-        select(); // _cs = 0;
+        spiDevice::select(); // _cs = 0;
+        _delay_us(50);
 
         // touch coordinates are sent in a 5-byte data packet
 
-        int pen = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int pen = transceiveByte(0); // _spi.write(0);
         _delay_us(50);
 
-        int xlo = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int xlo = transceiveByte(0); // _spi.write(0);
         _delay_us(50);
 
-        int xhi = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int xhi = transceiveByte(0); // _spi.write(0);
         _delay_us(50);
 
-        int ylo = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int ylo = transceiveByte(0); // _spi.write(0);
         _delay_us(50);
 
-        int yhi = SPI_MasterTransceiveByte(_spiAR1021,0); // _spi.write(0);
+        int yhi = transceiveByte(0); // _spi.write(0);
         _delay_us(50);
 
-        unselect(); //_cs = 1;
+        spiDevice::unselect(); //_cs = 1;
 
 
         // pen down
         if ((pen&AR1021_PEN_MASK) == (1<<7|1<<0)) {
-            _pen = 1;
+            actual.touched = true;
         }
         // pen up
         else if ((pen&AR1021_PEN_MASK) == (1<<7)){
-            _pen = 0;
+            actual.touched = false;
         }
         // invalid value
         else {
             continue;
         }
-
-        _x = ((xhi<<7)|xlo);
-        _y = ((yhi<<7)|ylo);
-
+        if(_rotated)
+        {
+          actual.y = ( ((xhi<<7)|xlo)* _height )>>12;
+          actual.x = ( ((yhi<<7)|ylo)* _width )>>12;
+        }
+        else
+        {
+          actual.x = ( ((xhi<<7)|xlo)* _width )>>12;
+          actual.y = ( ((yhi<<7)|ylo)* _height )>>12;
+        }
     }
 }
 
-void AR1021::select() {
-  AR1021_CS_PORT.OUTCLR = AR1021_CS;
-}
 
-void AR1021::unselect() {
-  AR1021_CS_PORT.OUTSET = AR1021_CS;
-}
-
-uint8_t AR1021::readRegister8(uint8_t reg)
+bool AR1021::compareCoord(const touchCoordinate_t& a, const touchCoordinate_t& b)
 {
-uint8_t ret;
-  select();
-  ret = SPI_MasterTransceiveByte(_spiAR1021,reg);
-  unselect();
-  return(ret);
+  return( (a.x==b.x) && (a.y==b.y) && (a.touched==b.touched) );
 }
+
+
